@@ -237,7 +237,7 @@ impl MailInfo<'_> {
             Some(s) => {
                 // "github.molgen.mpg.de [141.14.220.169]"
                 // "unknown [141.80.232.51]"
-                let mut split = s.split(" ");
+                let mut split = s.split(' ');
                 match split.next() {
                     Some(name) => match split.next() {
                         Some(ip) => (name, Self::remove_enclosing_brackets(ip)),
