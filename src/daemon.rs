@@ -194,7 +194,7 @@ fn process_client(
                 // reply disabled with SMFIP_NR_EOH
             }
             'B' => {
-                let buffer_space = truncate - storage.mail_buffer.len();
+                let buffer_space = truncate.saturating_sub(storage.mail_buffer.len());
                 let pos = data_reader.position() as usize;
                 let data = &data_reader.get_ref()[pos..];
                 if data.len() <= buffer_space {
