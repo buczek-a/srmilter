@@ -37,7 +37,7 @@ fn spamhaus_v6(ip: Ipv6Addr) -> String {
         out.push(nibble_to_ascii(o >> 4));
         out.push(b'.');
     }
-    out.extend_from_slice(&SPAMHAUS_POSTFIX.clone());
+    out.extend_from_slice(SPAMHAUS_POSTFIX);
     String::from_utf8_lossy(&out).into_owned()
 }
 
