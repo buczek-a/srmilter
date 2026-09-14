@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::env;
 use std::env::VarError;
 use std::error::Error;
-use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read as _, Seek as _, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read as _, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::FromRawFd as _;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
@@ -92,8 +92,7 @@ fn process_client(
     truncate: usize,
 ) -> Result<(), Box<dyn Error>> {
     let mut data_read_buffer: Vec<u8> = Vec::with_capacity(4096);
-    let data_write_buffer: Vec<u8> = Vec::with_capacity(64);
-    let mut writer = Cursor::new(data_write_buffer);
+    let mut write_buffer: Vec<u8> = Vec::with_capacity(64);
 
     let mut connect_macros: HashMap<String, String> = HashMap::new();
     let mut storage = MailInfoStorage::default();
@@ -115,14 +114,14 @@ fn process_client(
                 // let version = data_reader.read_u32_be()?;
                 // let actions = data_reader.read_u32_be()?;
                 // let protocol = data_reader.read_u32_be()?;
-                writer.rewind()?;
-                writer.write_all(b"O")?;
-                writer.write_all(&SMFIF_VERSION.to_be_bytes())?;
+                write_buffer.clear();
+                write_buffer.extend_from_slice(b"O");
+                write_buffer.extend_from_slice(&SMFIF_VERSION.to_be_bytes());
                 let mut actions = SMFIF_QUARANTINE;
                 if config.dkim_signer.is_some() {
                     actions |= SMFIF_ADDHDRS;
                 }
-                writer.write_all(&actions.to_be_bytes())?;
+                write_buffer.extend_from_slice(&actions.to_be_bytes());
                 let mut protocol = SMFIP_NOCONNECT
                     | SMFIP_NOHELO
                     | SMFIP_NR_HDR
@@ -139,9 +138,8 @@ fn process_client(
                 if truncate == usize::MAX {
                     protocol |= SMFIP_NR_BODY
                 }
-                writer.write_all(&protocol.to_be_bytes())?;
-                stream_writer.write_all(&((writer.position() as u32).to_be_bytes()))?;
-                stream_writer.write_all(&writer.get_ref()[0..writer.position() as usize])?;
+                write_buffer.extend_from_slice(&protocol.to_be_bytes());
+                write_pdu(&mut stream_writer, &write_buffer)?;
                 stream_writer.flush()?;
             }
             'D' => {
@@ -229,13 +227,12 @@ fn process_client(
                 if matches!(result, ClassifyResult::Accept | ClassifyResult::Quarantine)
                     && let Some(header_value) = crate::dkim_sign(config, &storage, truncate == 0)
                 {
-                    writer.rewind()?;
-                    writer.write_all(b"h")?; // SMFIR_ADDHEADER
-                    writer.write_all(b"DKIM-Signature\0")?;
-                    writer.write_all(&header_value)?;
-                    writer.write_all(b"\0")?;
-                    stream_writer.write_all(&((writer.position() as u32).to_be_bytes()))?;
-                    stream_writer.write_all(&writer.get_ref()[0..writer.position() as usize])?;
+                    write_buffer.clear();
+                    write_buffer.extend_from_slice(b"h"); // SMFIR_ADDHEADER
+                    write_buffer.extend_from_slice(b"DKIM-Signature\0");
+                    write_buffer.extend_from_slice(&header_value);
+                    write_buffer.extend_from_slice(b"\0");
+                    write_pdu(&mut stream_writer, &write_buffer)?;
                 }
                 match result {
                     ClassifyResult::Accept => {
@@ -257,13 +254,11 @@ fn process_client(
 
                         let msg = dup_percent(msg);
 
-                        writer.rewind()?;
-                        writer.write_all(b"y550 5.7.1 ")?;
-                        writer.write_all(&msg)?;
-                        writer.write_all(b"\0")?;
-                        stream_writer.write_all(&((writer.position() as u32).to_be_bytes()))?;
-                        stream_writer
-                            .write_all(&writer.get_ref()[0..writer.position() as usize])?;
+                        write_buffer.clear();
+                        write_buffer.extend_from_slice(b"y550 5.7.1 ");
+                        write_buffer.extend_from_slice(&msg);
+                        write_buffer.extend_from_slice(b"\0");
+                        write_pdu(&mut stream_writer, &write_buffer)?;
                     }
                     ClassifyResult::Quarantine => {
                         write_pdu(&mut stream_writer, b"qmilter\0")?; // SMFIR_QUARANTINE
