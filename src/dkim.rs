@@ -123,7 +123,11 @@ impl DkimSigner {
         let body_hash = if force_l0 {
             Sha256::digest([])
         } else {
-            Sha256::digest(canonicalize_body_relaxed(body))
+            let mut hasher = Sha256::new();
+            let mut bc = BodyCanonicalizer::new(&mut hasher);
+            bc.write(body);
+            bc.done();
+            hasher.finalize()
         };
         let bh = BASE64.encode(body_hash);
 
@@ -337,39 +341,88 @@ fn trim_wsp_str(s: &str) -> &str {
     std::str::from_utf8(trim_wsp(s.as_bytes())).unwrap_or(s)
 }
 
+// Something we can just dump &[u8] data into that never fails
+trait Pipe {
+    fn write(&mut self, data: &[u8]);
+    fn done(&mut self);
+}
+
+impl Pipe for Sha256 {
+    fn write(&mut self, data: &[u8]) {
+        self.update(data);
+    }
+    fn done(&mut self) {}
+}
+
 /// RFC 6376 §3.4.4 relaxed body canonicalization.
-fn canonicalize_body_relaxed(body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len());
-    let mut rest = body;
-    loop {
-        match rest.windows(2).position(|w| w == b"\r\n") {
-            Some(pos) => {
-                append_canonical_line(&mut out, &rest[..pos]);
-                out.extend_from_slice(b"\r\n");
-                rest = &rest[pos + 2..];
-            }
-            None => {
-                if !rest.is_empty() {
-                    append_canonical_line(&mut out, rest);
-                    out.extend_from_slice(b"\r\n");
-                }
-                break;
-            }
+struct BodyCanonicalizer<'a, P: Pipe> {
+    out: &'a mut P,
+    buf: Vec<u8>,          // holds an incomplete trailing line across write() calls
+    pending_blanks: usize, // count of blank CRLF lines not yet emitted
+    wrote_any: bool,       // whether any non-blank content has been emitted
+}
+
+impl<'a, P: Pipe> BodyCanonicalizer<'a, P> {
+    fn new(out: &'a mut P) -> Self {
+        Self {
+            out,
+            buf: Vec::new(),
+            pending_blanks: 0,
+            wrote_any: false,
         }
     }
-    // Ignore all empty lines at the end of the message body (an empty body
-    // to begin with is the degenerate case: canonical form is the empty
-    // string, not a CRLF -- that rule belongs to simple canonicalization).
-    loop {
-        if out == b"\r\n" {
-            out.clear();
-        } else if out.ends_with(b"\r\n\r\n") {
-            out.truncate(out.len() - 2);
+}
+
+impl<'a, P: Pipe> Pipe for BodyCanonicalizer<'a, P> {
+    fn write(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+        let mut start = 0;
+        while let Some(pos) = self.buf[start..].windows(2).position(|w| w == b"\r\n") {
+            let line_end = start + pos;
+            self.emit_line(start..line_end);
+            start = line_end + 2;
+        }
+        self.buf.drain(..start); // keep only the unterminated remainder
+    }
+
+    fn done(&mut self) {
+        if !self.buf.is_empty() {
+            // last line has no trailing CRLF in input; still gets one in output
+            let line = std::mem::take(&mut self.buf);
+            self.emit_line_bytes(&line);
+        }
+        // pending_blanks simply never flushed => correctly dropped
+        self.out.done();
+    }
+}
+
+impl<'a, P: Pipe> BodyCanonicalizer<'a, P> {
+    fn emit_line(&mut self, range: std::ops::Range<usize>) {
+        let line = self.buf[range].to_vec(); // small, single line only
+        self.emit_line_bytes(&line);
+    }
+
+    fn emit_line_bytes(&mut self, line: &[u8]) {
+        let mut canon = Vec::with_capacity(line.len());
+        append_canonical_line(&mut canon, line);
+        if canon.is_empty() {
+            self.pending_blanks += 1;
         } else {
-            break;
+            if self.wrote_any {
+                for _ in 0..self.pending_blanks {
+                    self.out.write(b"\r\n");
+                }
+            } else {
+                // blanks before any content are still "trailing" from the start;
+                // per original semantics they'd all collapse away since body
+                // starting blank has nothing before it — drop them too.
+            }
+            self.pending_blanks = 0;
+            self.out.write(&canon);
+            self.out.write(b"\r\n");
+            self.wrote_any = true;
         }
     }
-    out
 }
 
 /// Collapses intra-line WSP runs to a single SP and drops trailing WSP,
@@ -688,5 +741,20 @@ mod tests {
         public_key
             .verify(Pkcs1v15Sign::new::<Sha256>(), &digest, &signature)
             .unwrap();
+    }
+
+    impl Pipe for Vec<u8> {
+        fn write(&mut self, data: &[u8]) {
+            self.extend(data);
+        }
+        fn done(&mut self) {}
+    }
+
+    fn canonicalize_body_relaxed(body: &[u8]) -> Vec<u8> {
+        let mut v: Vec<u8> = Vec::new();
+        let mut bc = BodyCanonicalizer::new(&mut v);
+        bc.write(body);
+        bc.done();
+        v
     }
 }
