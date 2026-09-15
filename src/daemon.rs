@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::env;
 use std::env::VarError;
 use std::error::Error;
-use std::io::{BufRead, BufReader, BufWriter, Cursor, Read as _, Seek as _, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read as _, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::FromRawFd as _;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
@@ -92,8 +92,7 @@ fn process_client(
     truncate: usize,
 ) -> Result<(), Box<dyn Error>> {
     let mut data_read_buffer: Vec<u8> = Vec::with_capacity(4096);
-    let data_write_buffer: Vec<u8> = Vec::with_capacity(64);
-    let mut writer = Cursor::new(data_write_buffer);
+    let mut write_buffer: Vec<u8> = Vec::with_capacity(64);
 
     let mut connect_macros: HashMap<String, String> = HashMap::new();
     let mut storage = MailInfoStorage::default();
@@ -115,14 +114,14 @@ fn process_client(
                 // let version = data_reader.read_u32_be()?;
                 // let actions = data_reader.read_u32_be()?;
                 // let protocol = data_reader.read_u32_be()?;
-                writer.rewind()?;
-                writer.write_all(b"O")?;
-                writer.write_all(&SMFIF_VERSION.to_be_bytes())?;
+                write_buffer.clear();
+                write_buffer.extend_from_slice(b"O");
+                write_buffer.extend_from_slice(&SMFIF_VERSION.to_be_bytes());
                 let mut actions = SMFIF_QUARANTINE;
                 if config.dkim_signer.is_some() {
                     actions |= SMFIF_ADDHDRS;
                 }
-                writer.write_all(&actions.to_be_bytes())?;
+                write_buffer.extend_from_slice(&actions.to_be_bytes());
                 let mut protocol = SMFIP_NOCONNECT
                     | SMFIP_NOHELO
                     | SMFIP_NR_HDR
@@ -139,9 +138,8 @@ fn process_client(
                 if truncate == usize::MAX {
                     protocol |= SMFIP_NR_BODY
                 }
-                writer.write_all(&protocol.to_be_bytes())?;
-                stream_writer.write_all(&((writer.position() as u32).to_be_bytes()))?;
-                stream_writer.write_all(&writer.get_ref()[0..writer.position() as usize])?;
+                write_buffer.extend_from_slice(&protocol.to_be_bytes());
+                write_pdu(&mut stream_writer, &write_buffer)?;
                 stream_writer.flush()?;
             }
             'D' => {
@@ -194,7 +192,7 @@ fn process_client(
                 // reply disabled with SMFIP_NR_EOH
             }
             'B' => {
-                let buffer_space = truncate - storage.mail_buffer.len();
+                let buffer_space = truncate.saturating_sub(storage.mail_buffer.len());
                 let pos = data_reader.position() as usize;
                 let data = &data_reader.get_ref()[pos..];
                 if data.len() <= buffer_space {
@@ -208,19 +206,9 @@ fn process_client(
                     // reply disabled with SMFIP_NR_BODY
                 } else {
                     if storage.mail_buffer.len() < truncate {
-                        // continue
-                        writer.rewind()?;
-                        writer.write_all(b"c")?; // SMFIR_CONTINUE
-                        stream_writer.write_all(&((writer.position() as u32).to_be_bytes()))?;
-                        stream_writer
-                            .write_all(&writer.get_ref()[0..writer.position() as usize])?;
+                        write_pdu(&mut stream_writer, b"c")?; // SMFIR_CONTINUE
                     } else {
-                        // skip
-                        writer.rewind()?;
-                        writer.write_all(b"s")?; // SMFIR_SKIP
-                        stream_writer.write_all(&((writer.position() as u32).to_be_bytes()))?;
-                        stream_writer
-                            .write_all(&writer.get_ref()[0..writer.position() as usize])?;
+                        write_pdu(&mut stream_writer, b"s")?; // SMFIR_SKIP
                     }
                     stream_writer.flush()?;
                 }
@@ -239,28 +227,19 @@ fn process_client(
                 if matches!(result, ClassifyResult::Accept | ClassifyResult::Quarantine)
                     && let Some(header_value) = crate::dkim_sign(config, &storage, truncate == 0)
                 {
-                    writer.rewind()?;
-                    writer.write_all(b"h")?; // SMFIR_ADDHEADER
-                    writer.write_all(b"DKIM-Signature\0")?;
-                    writer.write_all(&header_value)?;
-                    writer.write_all(b"\0")?;
-                    stream_writer.write_all(&((writer.position() as u32).to_be_bytes()))?;
-                    stream_writer.write_all(&writer.get_ref()[0..writer.position() as usize])?;
+                    write_buffer.clear();
+                    write_buffer.extend_from_slice(b"h"); // SMFIR_ADDHEADER
+                    write_buffer.extend_from_slice(b"DKIM-Signature\0");
+                    write_buffer.extend_from_slice(&header_value);
+                    write_buffer.extend_from_slice(b"\0");
+                    write_pdu(&mut stream_writer, &write_buffer)?;
                 }
                 match result {
                     ClassifyResult::Accept => {
-                        writer.rewind()?;
-                        writer.write_all(b"a")?; // SMFIR_ACCEPT
-                        stream_writer.write_all(&((writer.position() as u32).to_be_bytes()))?;
-                        stream_writer
-                            .write_all(&writer.get_ref()[0..writer.position() as usize])?;
+                        write_pdu(&mut stream_writer, b"a")?; // SMFIR_ACCEPT
                     }
                     ClassifyResult::Reject => {
-                        writer.rewind()?;
-                        writer.write_all(b"r")?; // SMFIR_REJECT
-                        stream_writer.write_all(&((writer.position() as u32).to_be_bytes()))?;
-                        stream_writer
-                            .write_all(&writer.get_ref()[0..writer.position() as usize])?;
+                        write_pdu(&mut stream_writer, b"r")?; // SMFIR_REJECT
                     }
                     ClassifyResult::RejectWithMsg(msg) => {
                         // Silently truncate the message text to max 200 characters. A longer message
@@ -275,37 +254,19 @@ fn process_client(
 
                         let msg = dup_percent(msg);
 
-                        writer.rewind()?;
-                        writer.write_all(b"y550 5.7.1 ")?;
-                        writer.write_all(&msg)?;
-                        writer.write_all(b"\0")?;
-                        stream_writer.write_all(&((writer.position() as u32).to_be_bytes()))?;
-                        stream_writer
-                            .write_all(&writer.get_ref()[0..writer.position() as usize])?;
+                        write_buffer.clear();
+                        write_buffer.extend_from_slice(b"y550 5.7.1 ");
+                        write_buffer.extend_from_slice(&msg);
+                        write_buffer.extend_from_slice(b"\0");
+                        write_pdu(&mut stream_writer, &write_buffer)?;
                     }
                     ClassifyResult::Quarantine => {
-                        writer.rewind()?;
-                        writer.write_all(b"qmilter\0")?; // SMFIR_QUARANTINE
-                        stream_writer.write_all(&((writer.position() as u32).to_be_bytes()))?;
-                        stream_writer
-                            .write_all(&writer.get_ref()[0..writer.position() as usize])?;
-                        writer.rewind()?;
-                        writer.write_all(b"a")?; // SMFIR_ACCEPT
-                        stream_writer.write_all(&((writer.position() as u32).to_be_bytes()))?;
-                        stream_writer
-                            .write_all(&writer.get_ref()[0..writer.position() as usize])?;
+                        write_pdu(&mut stream_writer, b"qmilter\0")?; // SMFIR_QUARANTINE
+                        write_pdu(&mut stream_writer, b"a")?; // SMFIR_ACCEPT
                     }
                     ClassifyResult::Discard => {
-                        writer.rewind()?;
-                        writer.write_all(b"d")?; // SMFIR_DISCARD
-                        stream_writer.write_all(&((writer.position() as u32).to_be_bytes()))?;
-                        stream_writer
-                            .write_all(&writer.get_ref()[0..writer.position() as usize])?;
-                        writer.rewind()?;
-                        writer.write_all(b"a")?; // SMFIR_ACCEPT
-                        stream_writer.write_all(&((writer.position() as u32).to_be_bytes()))?;
-                        stream_writer
-                            .write_all(&writer.get_ref()[0..writer.position() as usize])?;
+                        write_pdu(&mut stream_writer, b"d")?; // SMFIR_DISCARD
+                        write_pdu(&mut stream_writer, b"a")?; // SMFIR_ACCEPT
                     }
                 };
                 stream_writer.flush()?;
@@ -330,6 +291,11 @@ fn process_client(
         data_read_buffer = data_reader.into_inner();
     }
     Ok(())
+}
+
+fn write_pdu(stream_writer: &mut impl Write, data: &[u8]) -> io::Result<()> {
+    stream_writer.write_all(&((data.len() as u32).to_be_bytes()))?;
+    stream_writer.write_all(data)
 }
 
 extern "C" fn handlerfunc(signum: c_int) {
