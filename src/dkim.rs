@@ -359,7 +359,6 @@ struct BodyCanonicalizer<'a, P: Pipe> {
     out: &'a mut P,
     buf: Vec<u8>,          // holds an incomplete trailing line across write() calls
     pending_blanks: usize, // count of blank CRLF lines not yet emitted
-    wrote_any: bool,       // whether any non-blank content has been emitted
 }
 
 impl<'a, P: Pipe> BodyCanonicalizer<'a, P> {
@@ -368,7 +367,6 @@ impl<'a, P: Pipe> BodyCanonicalizer<'a, P> {
             out,
             buf: Vec::new(),
             pending_blanks: 0,
-            wrote_any: false,
         }
     }
 }
@@ -408,19 +406,15 @@ impl<'a, P: Pipe> BodyCanonicalizer<'a, P> {
         if canon.is_empty() {
             self.pending_blanks += 1;
         } else {
-            if self.wrote_any {
-                for _ in 0..self.pending_blanks {
-                    self.out.write(b"\r\n");
-                }
-            } else {
-                // blanks before any content are still "trailing" from the start;
-                // per original semantics they'd all collapse away since body
-                // starting blank has nothing before it — drop them too.
+            // Any blanks buffered so far precede real content, so they are
+            // not trailing after all: flush them now. A run of blanks is
+            // only ever dropped when done() is reached with none flushed.
+            for _ in 0..self.pending_blanks {
+                self.out.write(b"\r\n");
             }
             self.pending_blanks = 0;
             self.out.write(&canon);
             self.out.write(b"\r\n");
-            self.wrote_any = true;
         }
     }
 }
@@ -577,6 +571,16 @@ mod tests {
     fn body_of_only_blank_lines_canonicalizes_to_empty() {
         assert_eq!(canonicalize_body_relaxed(b"\r\n"), b"");
         assert_eq!(canonicalize_body_relaxed(b"\r\n\r\n\r\n"), b"");
+    }
+
+    #[test]
+    fn body_keeps_leading_blank_lines() {
+        // Only a trailing run of blank lines is stripped (RFC 6376 §3.4.4);
+        // blank lines before the first non-blank line must survive.
+        assert_eq!(
+            canonicalize_body_relaxed(b"\r\n\r\n    \t\t\t\r\nhello\r\n"),
+            b"\r\n\r\n\r\nhello\r\n"
+        );
     }
 
     #[test]
