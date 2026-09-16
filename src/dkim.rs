@@ -4,7 +4,7 @@ use rsa::pkcs8::DecodePrivateKey;
 use rsa::{Pkcs1v15Sign, RsaPrivateKey};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fmt;
+use std::fmt::{self, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default set of header field names to sign, in signing order.
@@ -110,25 +110,21 @@ impl DkimSigner {
     /// `DKIM-Signature:`) for a message.
     ///
     /// `headers` is the ordered list of raw `(name, value)` pairs as
-    /// delivered by the milter `'L'` command, verbatim. `force_l0` must be
-    /// set when `body` is known to be incomplete (the caller received no
-    /// body at all); in that case the signature declares `l=0`, honestly
-    /// covering zero body bytes, and `body` is expected to be empty.
+    /// delivered by the milter `'L'` command, verbatim. `truncated` must
+    /// be set when `body` is known to be incomplete. In that case the
+    /// signature gets a `l=NNN` tag with the size of the signed (canonicalized) body.
     pub(crate) fn sign(
         &self,
         headers: &[(String, Vec<u8>)],
         body: &[u8],
-        force_l0: bool,
+        truncated: bool,
     ) -> Result<String, DkimError> {
-        let body_hash = if force_l0 {
-            Sha256::digest([])
-        } else {
-            let mut hasher = Sha256::new();
-            let mut bc = BodyCanonicalizer::new(&mut hasher);
-            bc.write(body);
-            bc.done();
-            hasher.finalize()
-        };
+        let mut hasher = Sha256::new();
+        let mut bc = BodyCanonicalizer::new(&mut hasher);
+        bc.write(body);
+        bc.done();
+        let signed_body_len = bc.octets_written;
+        let body_hash = hasher.finalize();
         let bh = BASE64.encode(body_hash);
 
         let timestamp = SystemTime::now()
@@ -136,17 +132,21 @@ impl DkimSigner {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let mut value = format!(
-            "v=1; a=rsa-sha256; c=relaxed/relaxed; d={}; s={}; t={}; h={}; bh={}; ",
+        let mut value = String::with_capacity(600);
+        value.push_str("v=1; a=rsa-sha256; c=relaxed/relaxed; ");
+        if truncated {
+            write!(value, "l={signed_body_len}; ").unwrap();
+        }
+        write!(
+            value,
+            "d={}; s={}; t={}; h={}; bh={}; ",
             self.domain,
             self.selector,
             timestamp,
             self.headers.join(":"),
             bh,
-        );
-        if force_l0 {
-            value.push_str("l=0; ");
-        }
+        )
+        .unwrap();
         value.push_str("b=");
 
         // Group actual header occurrences by lowercased name, preserving
