@@ -574,6 +574,16 @@ mod tests {
     }
 
     #[test]
+    fn body_keeps_leading_blank_lines() {
+        // Only a trailing run of blank lines is stripped (RFC 6376 §3.4.4);
+        // blank lines before the first non-blank line must survive.
+        assert_eq!(
+            canonicalize_body_relaxed(b"\r\n\r\n    \t\t\t\r\nhello\r\n"),
+            b"\r\n\r\n\r\nhello\r\n"
+        );
+    }
+
+    #[test]
     fn empty_body_canonicalizes_to_empty_string_not_crlf() {
         let canonical = canonicalize_body_relaxed(b"");
         assert_eq!(canonical, b"");
