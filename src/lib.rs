@@ -30,6 +30,10 @@ struct MailInfoStorage {
     // Byte offset into `mail_buffer` where the body starts, i.e. right
     // after the blank-line separator. Used only for DKIM signing.
     header_end: usize,
+    // Has the body been truncated by the `--truncate` feature?
+    // Used by DKIM signer. Note, that combination of DKIM signer and --truncate
+    // is questionable.
+    body_is_truncated: bool,
 }
 
 /// Provides read-only access to a parsed email message.
@@ -493,14 +497,10 @@ fn classify_mail(config: &Config, storage: &MailInfoStorage) -> ClassifyResult {
 /// [`DkimSigner`] is configured. Signing failures are logged (queue-ID
 /// prefixed) and never propagated: a signing bug must never cause mail
 /// loss or bounces, so the mail is still delivered, just unsigned.
-pub(crate) fn dkim_sign(
-    config: &Config,
-    storage: &MailInfoStorage,
-    truncated: bool,
-) -> Option<Vec<u8>> {
+pub(crate) fn dkim_sign(config: &Config, storage: &MailInfoStorage) -> Option<Vec<u8>> {
     let signer = config.dkim_signer.as_ref()?;
     let body = &storage.mail_buffer[storage.header_end..];
-    match signer.sign(&storage.dkim_header_pairs, body, truncated) {
+    match signer.sign(&storage.dkim_header_pairs, body, storage.body_is_truncated) {
         Ok(value) => Some(value.into_bytes()),
         Err(e) => {
             eprintln!("{}: DKIM signing failed: {e}", storage.id);
@@ -599,7 +599,7 @@ mod tests {
     fn dkim_sign_declares_l_when_truncated() {
         let config = Config::builder().dkim_signer(test_dkim_signer()).build();
 
-        let storage = MailInfoStorage {
+        let mut storage = MailInfoStorage {
             id: "test".to_string(),
             mail_buffer: b"From: a@example.com\r\n\r\n".to_vec(),
             dkim_header_pairs: vec![("From".to_string(), b"a@example.com".to_vec())],
@@ -607,13 +607,14 @@ mod tests {
             ..Default::default()
         };
 
-        let dkim_value = dkim_sign(&config, &storage, false).unwrap();
+        let dkim_value = dkim_sign(&config, &storage).unwrap();
         assert!(!String::from_utf8(dkim_value).unwrap().contains("l="));
 
-        let dkim_value = dkim_sign(&config, &storage, true).unwrap();
+        storage.body_is_truncated = true;
+        let dkim_value = dkim_sign(&config, &storage).unwrap();
         assert!(String::from_utf8(dkim_value).unwrap().contains("l=0; "));
 
-        let storage = MailInfoStorage {
+        let mut storage = MailInfoStorage {
             id: "test".to_string(),
             mail_buffer: b"From: a@example.com\r\n\r\nbody\r\n".to_vec(),
             dkim_header_pairs: vec![("From".to_string(), b"a@example.com".to_vec())],
@@ -621,10 +622,11 @@ mod tests {
             ..Default::default()
         };
 
-        let dkim_value = dkim_sign(&config, &storage, false).unwrap();
+        let dkim_value = dkim_sign(&config, &storage).unwrap();
         assert!(!String::from_utf8(dkim_value).unwrap().contains("l="));
 
-        let dkim_value = dkim_sign(&config, &storage, true).unwrap();
+        storage.body_is_truncated = true;
+        let dkim_value = dkim_sign(&config, &storage).unwrap();
         assert!(String::from_utf8(dkim_value).unwrap().contains("l=6; "));
     }
 
@@ -644,7 +646,7 @@ mod tests {
         let config = Config::builder().build();
         let storage = MailInfoStorage::default();
         assert!(config.dkim_signer.is_none());
-        assert!(dkim_sign(&config, &storage, false).is_none());
+        assert!(dkim_sign(&config, &storage).is_none());
     }
 
     #[test]

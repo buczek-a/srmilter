@@ -99,8 +99,6 @@ fn process_client(
 
     let mut string_buffer = Vec::<u8>::new();
 
-    let mut body_is_truncated = false;
-
     loop {
         let len = stream_reader.read_u32_be()?;
         if len > 69632 {
@@ -136,7 +134,7 @@ fn process_client(
                     | SMFIP_NR_EOH;
                 if truncate == 0 {
                     protocol |= SMFIP_NOBODY;
-                    body_is_truncated = true;
+                    storage.body_is_truncated = true;
                 }
                 if truncate == usize::MAX {
                     protocol |= SMFIP_NR_BODY
@@ -212,7 +210,7 @@ fn process_client(
                         write_pdu(&mut stream_writer, b"c")?; // SMFIR_CONTINUE
                     } else {
                         write_pdu(&mut stream_writer, b"s")?; // SMFIR_SKIP
-                        body_is_truncated = true;
+                        storage.body_is_truncated = true;
                     }
                     stream_writer.flush()?;
                 }
@@ -229,8 +227,7 @@ fn process_client(
                     .to_string();
                 let result = classify_mail(config, &storage);
                 if matches!(result, ClassifyResult::Accept | ClassifyResult::Quarantine)
-                    && let Some(header_value) =
-                        crate::dkim_sign(config, &storage, body_is_truncated)
+                    && let Some(header_value) = crate::dkim_sign(config, &storage)
                 {
                     write_buffer.clear();
                     write_buffer.extend_from_slice(b"h"); // SMFIR_ADDHEADER
@@ -276,7 +273,6 @@ fn process_client(
                 };
                 stream_writer.flush()?;
                 storage = MailInfoStorage::default();
-                body_is_truncated = false;
             }
             'Q' => {
                 // no reply to SMFIC_QUIT
@@ -284,7 +280,6 @@ fn process_client(
             }
             'A' => {
                 storage = MailInfoStorage::default();
-                body_is_truncated = false;
                 // no reply to SMFIC_ABORT
             }
             _ => {
