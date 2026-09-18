@@ -120,7 +120,7 @@ impl DkimSigner {
         truncated: bool,
     ) -> Result<String, DkimError> {
         let mut hasher = Sha256::new();
-        let mut bc = BodyCanonicalizer::new(&mut hasher);
+        let mut bc = BodyCanonicalizer::new(&mut hasher, truncated);
         bc.write(body);
         bc.done();
         let signed_body_len = bc.octets_written;
@@ -357,18 +357,20 @@ impl Pipe for Sha256 {
 /// RFC 6376 §3.4.4 relaxed body canonicalization.
 struct BodyCanonicalizer<'a, P: Pipe> {
     out: &'a mut P,
-    buf: Vec<u8>,          // holds an incomplete trailing line across write() calls
-    pending_blanks: usize, // count of blank CRLF lines not yet emitted
-    octets_written: usize, // number of octets written to out
+    buf: Vec<u8>,            // holds an incomplete trailing line across write() calls
+    pending_blanks: usize,   // count of blank CRLF lines not yet emitted
+    octets_written: usize,   // number of octets written to out
+    body_is_truncated: bool, // user said that the body has been truncated
 }
 
 impl<'a, P: Pipe> BodyCanonicalizer<'a, P> {
-    fn new(out: &'a mut P) -> Self {
+    fn new(out: &'a mut P, body_is_truncated: bool) -> Self {
         Self {
             out,
             buf: Vec::new(),
             pending_blanks: 0,
             octets_written: 0,
+            body_is_truncated,
         }
     }
 }
@@ -386,7 +388,7 @@ impl<'a, P: Pipe> Pipe for BodyCanonicalizer<'a, P> {
     }
 
     fn done(&mut self) {
-        if !self.buf.is_empty() {
+        if !self.buf.is_empty() && !self.body_is_truncated {
             // last line has no trailing CRLF in input; still gets one in output
             self.emit_line(0..self.buf.len());
         }
@@ -758,7 +760,7 @@ mod tests {
 
     fn canonicalize_body_relaxed(body: &[u8]) -> Vec<u8> {
         let mut v: Vec<u8> = Vec::new();
-        let mut bc = BodyCanonicalizer::new(&mut v);
+        let mut bc = BodyCanonicalizer::new(&mut v, false);
         bc.write(body);
         bc.done();
         let octets_written = bc.octets_written;
