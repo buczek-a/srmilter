@@ -134,6 +134,10 @@ fn process_client(
                     | SMFIP_NR_EOH;
                 if truncate == 0 {
                     protocol |= SMFIP_NOBODY;
+                    // Although an email with an empty body would not be truncated, we assume it is. We want to
+                    // avoid requesting the body anyway because --truncate=0 is used as a privacy feature for
+                    // remote smtpd in production.
+                    // With --truncate=0 we don't DKIM-sign the body of any email, even not those with empty bodies.
                     storage.body_is_truncated = true;
                 }
                 if truncate == usize::MAX {
@@ -206,7 +210,7 @@ fn process_client(
                 if truncate == usize::MAX {
                     // reply disabled with SMFIP_NR_BODY
                 } else {
-                    if storage.mail_buffer.len() < truncate {
+                    if data.len() <= buffer_space {
                         write_pdu(&mut stream_writer, b"c")?; // SMFIR_CONTINUE
                     } else {
                         write_pdu(&mut stream_writer, b"s")?; // SMFIR_SKIP
